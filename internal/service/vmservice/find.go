@@ -39,6 +39,11 @@ var (
 
 	// ErrVMNotInitialized VM is not Initialized in Proxmox.
 	ErrVMNotInitialized = errors.New("vm not initialized")
+
+	// ErrVMIDCollision is returned when spec.virtualMachineID resolves to a VM owned by a
+	// different machine, i.e. the chosen id collides with another VM sharing the Proxmox VMID
+	// namespace. See handleVMIDCollision for how this is recovered from or surfaced.
+	ErrVMIDCollision = errors.New("vmid collision: id belongs to a different vm")
 )
 
 // FindVM returns the Proxmox VM if the vmID is set, otherwise
@@ -54,9 +59,16 @@ func FindVM(ctx context.Context, scope *scope.MachineScope) (*proxmox.VirtualMac
 			scope.Error(err, "unable to find vm")
 			return nil, ErrVMNotFound
 		}
-		if vm.Name != scope.ProxmoxMachine.GetName() {
-			scope.Error(err, "vm is not initialized yet")
+		// A freshly-cloned VM may not have its name populated yet; wait for it.
+		if vm.Name == "" {
+			scope.Info("vm is not initialized yet")
 			return nil, ErrVMNotInitialized
+		}
+		// A non-empty name that is not ours means the id resolves to a different machine's VM:
+		// a VMID collision (handled by the caller via handleVMIDCollision).
+		if vm.Name != scope.ProxmoxMachine.GetName() {
+			return nil, fmt.Errorf("vmid %d resolves to VM %q, expected %q: %w",
+				vmID, vm.Name, scope.ProxmoxMachine.GetName(), ErrVMIDCollision)
 		}
 		return vm, nil
 	}
@@ -101,43 +113,14 @@ func updateVMLocation(ctx context.Context, s *scope.MachineScope) error {
 		return errors.New("vm exists but does not have a name yet")
 	}
 
-	// If there is a machine with an ID that doesn't match name of the
-	// Proxmox machine, the chosen VMID belongs to a different VM.
+	// If we locate the VM cluster-wide but its name doesn't match this machine, the chosen
+	// VMID belongs to a different VM. Report it as a collision; the caller decides whether to
+	// recover or fail (see handleVMIDCollision). This keeps collision handling in one place,
+	// reachable from every detection path.
 	machineName := s.ProxmoxMachine.GetName()
 	if vm.VirtualMachineConfig.Name != machineName {
-		err := fmt.Errorf("expected VM name to match %q but it was %q", machineName, vm.VirtualMachineConfig.Name)
-
-		// If we have never adopted a VM (no providerID), this is a VMID collision: two
-		// reconciles sharing one Proxmox VMID namespace selected the same id and the other
-		// won the race. Treat it as recoverable — release the id, reset the state machine to
-		// Cloning (non-terminal, so HasFailed stays false) and return a transient error so
-		// the controller requeues with backoff. The next reconcile re-selects a fresh id.
-		// TaskRef is guaranteed nil here (see the early return above), so only the id and
-		// the (stale) node location need clearing.
-		if s.ProxmoxMachine.Spec.ProviderID == "" {
-			s.Logger.Info("VMID collision detected, releasing id and requeueing for re-selection",
-				"vmID", vmID, "conflictingVM", vm.VirtualMachineConfig.Name)
-			s.ClearVirtualMachineID()
-			s.ProxmoxMachine.Status.ProxmoxNode = nil
-			conditions.Set(s.ProxmoxMachine, metav1.Condition{
-				Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
-				Status:  metav1.ConditionFalse,
-				Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
-				Message: err.Error(),
-			})
-			return err
-		}
-
-		// We had already adopted a VM at this id but its name no longer matches. This is not a
-		// benign allocation race; surface it as a terminal failure for operator attention
-		// (preserves the anti-adoption guard against cross-cluster VM takeover).
-		conditions.Set(s.ProxmoxMachine, metav1.Condition{
-			Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
-			Status:  metav1.ConditionFalse,
-			Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedVMProvisionFailedReason,
-			Message: err.Error(),
-		})
-		return err
+		return fmt.Errorf("vmid %d resolves to VM %q, expected %q: %w",
+			vmID, vm.VirtualMachineConfig.Name, machineName, ErrVMIDCollision)
 	}
 
 	// Update the Proxmox node in the status.
@@ -155,4 +138,52 @@ func updateVMLocation(ctx context.Context, s *scope.MachineScope) error {
 	}
 
 	return nil
+}
+
+// handleVMIDCollision reacts to a detected VMID collision (cause wraps ErrVMIDCollision).
+//
+// It self-heals only a controller-selected id that has not been adopted yet: two reconciles
+// sharing one Proxmox VMID namespace selected the same id and the other won the race. In that
+// case it releases the id and resets the state machine to Cloning (non-terminal), so the next
+// reconcile selects a fresh one. Re-selection provably skips occupied ids (Proxmox nextid
+// advances, and the range path CheckID-skips taken ids, failing terminally on exhaustion), so
+// this converges rather than looping.
+//
+// It stays terminal (VMProvisionFailed, so MachineHealthCheck can remediate) when either:
+//   - providerID is set: we already adopted a VM at this id and its name changed — operator
+//     -worthy, and never silently abandon an adopted VM (anti-adoption guard); or
+//   - Status.ProxmoxNode is nil: createVM never ran for this machine, so the id was pinned by
+//     an operator (or otherwise set externally) rather than allocated by the controller;
+//     clobbering it would violate intent.
+//
+// The returned error is always the (transient) cause, so the controller requeues; the terminal
+// path additionally latches HasFailed so the next reconcile short-circuits.
+func handleVMIDCollision(s *scope.MachineScope, cause error) error {
+	if s.ProxmoxMachine.Spec.ProviderID != "" || s.ProxmoxMachine.Status.ProxmoxNode == nil {
+		conditions.Set(s.ProxmoxMachine, metav1.Condition{
+			Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
+			Status:  metav1.ConditionFalse,
+			Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedVMProvisionFailedReason,
+			Message: cause.Error(),
+		})
+		return cause
+	}
+
+	s.Logger.Info("VMID collision detected, releasing id and requeueing for re-selection",
+		"vmID", s.GetVirtualMachineID(), "cause", cause.Error())
+	s.ClearVirtualMachineID()
+	s.ProxmoxMachine.Status.ProxmoxNode = nil
+	// Drop the stale cluster-status node location so a later AddNodeLocation on re-clone is not
+	// a no-op (AddNodeLocation skips machines it already knows).
+	s.InfraCluster.ProxmoxCluster.RemoveNodeLocation(s.ProxmoxMachine.GetName(), util.IsControlPlaneMachine(s.Machine))
+	conditions.Set(s.ProxmoxMachine, metav1.Condition{
+		Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
+		Message: cause.Error(),
+	})
+	if err := s.InfraCluster.PatchObject(); err != nil {
+		return err
+	}
+	return cause
 }

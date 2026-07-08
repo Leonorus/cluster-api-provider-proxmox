@@ -382,14 +382,20 @@ this shared VMID namespace can produce collisions: two `ProxmoxMachine` objects 
 provisioned at nearly the same time — e.g. concurrent rolling upgrades across clusters — may be
 handed the **same** VMID before either clone has registered with Proxmox.
 
-capmox self-heals from such a collision: the machine that loses the race releases the colliding
-VMID and re-selects a fresh one on the next reconcile, rather than getting stuck. You may still
-see a transient `Cloning` blip and a re-selected `virtualMachineID` in that machine's status.
+capmox self-heals from such a collision: the machine that loses the race — i.e. the VMID it
+picked turns out to belong to a different machine's VM — releases the colliding VMID and
+re-selects a fresh one on the next reconcile, rather than getting stuck. You may still see a
+transient `Cloning` blip and a re-selected `virtualMachineID` in that machine's status. This
+recovery only applies to VMIDs that capmox itself allocated: if you **pin** a `virtualMachineID`
+manually and it resolves to another VM, that is treated as a misconfiguration and surfaced as a
+terminal `VMProvisionFailed` failure for you to correct, not silently re-rolled.
 
 To avoid collisions entirely, assign each `ProxmoxMachineTemplate` a **non-overlapping**
-`vmIDRange`. VMID selection within a range considers every `ProxmoxMachine` the controller can
-see across all CAPI clusters, so disjoint ranges guarantee no two clusters ever contend for the
-same ID:
+`vmIDRange`. VMID selection within a range considers every `ProxmoxMachine` that targets the
+**same Proxmox endpoint** (across all CAPI clusters and namespaces sharing that endpoint's
+credentials), so disjoint ranges guarantee no two clusters on the same Proxmox ever contend for
+the same ID. Machines targeting a *different* Proxmox endpoint are ignored, since their VMIDs
+live in a separate namespace and cannot collide:
 
 ```diff
 kind: ProxmoxMachineTemplate

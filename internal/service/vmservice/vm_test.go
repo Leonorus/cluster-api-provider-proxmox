@@ -23,6 +23,7 @@ import (
 
 	lutherproxmox "github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -392,8 +393,9 @@ func TestEnsureVirtualMachine_CreateVM_VMIDRangeCheckExisting(t *testing.T) {
 
 // TestEnsureVirtualMachine_CreateVM_VMIDRangeSkipsOtherCluster verifies that VMID selection
 // excludes ids already claimed by ProxmoxMachines in *other* CAPI clusters / namespaces that
-// share the same Proxmox VMID namespace (issue #842). The foreign machine holds 1000, so the
-// range selection must skip it and pick 1001.
+// share the same Proxmox VMID namespace (issue #842). The foreign machine's endpoint cannot be
+// resolved here (no Cluster/ProxmoxCluster for it), so it is included conservatively: it holds
+// 1000, so the range selection must skip it and pick 1001.
 func TestEnsureVirtualMachine_CreateVM_VMIDRangeSkipsOtherCluster(t *testing.T) {
 	machineScope, proxmoxClient, kubeClient := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
 	machineScope.ProxmoxMachine.Spec.VMIDRange = &infrav1.VMIDRange{
@@ -425,6 +427,60 @@ func TestEnsureVirtualMachine_CreateVM_VMIDRangeSkipsOtherCluster(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, requeue)
 	require.Equal(t, int64(1001), machineScope.ProxmoxMachine.GetVirtualMachineID())
+}
+
+// TestEnsureVirtualMachine_CreateVM_VMIDRangeIgnoresOtherEndpoint verifies that VMID selection
+// does NOT exclude ids claimed by ProxmoxMachines targeting a *different* Proxmox endpoint,
+// since ids on another server cannot collide here (issue #842 review). The foreign machine
+// resolves to a ProxmoxCluster with a different credentialsRef, so its id 1000 is ignored and
+// selection picks 1000.
+func TestEnsureVirtualMachine_CreateVM_VMIDRangeIgnoresOtherEndpoint(t *testing.T) {
+	machineScope, proxmoxClient, kubeClient := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
+	machineScope.ProxmoxMachine.Spec.VMIDRange = &infrav1.VMIDRange{
+		Start: 1000,
+		End:   1002,
+	}
+
+	// A ProxmoxCluster on a different Proxmox endpoint (distinct credentialsRef) and the CAPI
+	// cluster that references it.
+	otherProxmoxCluster := &infrav1.ProxmoxCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "other-ns"},
+		Spec: infrav1.ProxmoxClusterSpec{
+			CredentialsRef: &corev1.SecretReference{Name: "other-creds", Namespace: "other-ns"},
+		},
+	}
+	otherCluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "other-ns"},
+		Spec: clusterv1.ClusterSpec{
+			InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+				Kind: "ProxmoxCluster",
+				Name: "other",
+			},
+		},
+	}
+	// A ProxmoxMachine in that other cluster, holding an in-range id on the other endpoint.
+	foreign := &infrav1.ProxmoxMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foreign",
+			Namespace: "other-ns",
+			Labels:    map[string]string{"cluster.x-k8s.io/cluster-name": "other"},
+		},
+		Spec: infrav1.ProxmoxMachineSpec{VirtualMachineID: ptr.To(int64(1000))},
+	}
+	require.NoError(t, kubeClient.Create(context.Background(), otherProxmoxCluster))
+	require.NoError(t, kubeClient.Create(context.Background(), otherCluster))
+	require.NoError(t, kubeClient.Create(context.Background(), foreign))
+
+	expectedOptions := proxmox.VMCloneRequest{Node: "node1", NewID: 1000, Name: "test", Full: 1}
+	response := proxmox.VMCloneResponse{Task: newTask(), NewID: int64(1000)}
+	// 1000 is on a different endpoint, so it is NOT skipped: it is checked and found free.
+	proxmoxClient.Mock.On("CheckID", context.Background(), int64(1000)).Return(true, nil).Once()
+	proxmoxClient.EXPECT().CloneVM(context.Background(), 123, expectedOptions).Return(response, nil).Once()
+
+	requeue, err := ensureVirtualMachine(context.Background(), machineScope)
+	require.NoError(t, err)
+	require.True(t, requeue)
+	require.Equal(t, int64(1000), machineScope.ProxmoxMachine.GetVirtualMachineID())
 }
 
 func TestEnsureVirtualMachine_FindVM(t *testing.T) {

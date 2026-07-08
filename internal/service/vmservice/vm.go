@@ -205,12 +205,19 @@ func ensureVirtualMachine(ctx context.Context, machineScope *scope.MachineScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrVMNotFound):
-			if err := updateVMLocation(ctx, machineScope); err != nil {
-				return false, errors.Wrap(err, "error trying to locate vm")
+			// The VM might be orphaned on another node; try to relocate it. updateVMLocation
+			// searches cluster-wide and reports a collision if the id belongs to a foreign VM.
+			if lerr := updateVMLocation(ctx, machineScope); lerr != nil {
+				if errors.Is(lerr, ErrVMIDCollision) {
+					return false, handleVMIDCollision(machineScope, lerr)
+				}
+				return false, errors.Wrap(lerr, "error trying to locate vm")
 			}
 
 			// we always want to trigger reconciliation at this point.
 			return false, err
+		case errors.Is(err, ErrVMIDCollision):
+			return false, handleVMIDCollision(machineScope, err)
 		case errors.Is(err, ErrVMNotInitialized):
 			return true, err
 		case !errors.Is(err, ErrVMNotCreated):
@@ -542,7 +549,7 @@ func getNextFreeVMIDfromRange(ctx context.Context, scope *scope.MachineScope, vm
 	}
 	// Get next free vmid from the range
 	for i := vmIDRangeStart; i <= vmIDRangeEnd; i++ {
-		if slices.Contains(usedVMIDs, i) {
+		if _, used := usedVMIDs[i]; used {
 			continue
 		}
 		if vmidFree, err := scope.InfraCluster.ProxmoxClient.CheckID(ctx, i); err == nil && vmidFree {
@@ -555,19 +562,19 @@ func getNextFreeVMIDfromRange(ctx context.Context, scope *scope.MachineScope, vm
 	return 0, ErrNoVMIDInRangeFree
 }
 
-func getUsedVMIDs(ctx context.Context, scope *scope.MachineScope) ([]int64, error) {
-	// Get all used vmids from existing ProxmoxMachines. VMIDs are unique across the whole
-	// Proxmox cluster, which may be shared by multiple CAPI clusters, so we must look at every
-	// ProxmoxMachine the controller can see - not just this cluster's - to avoid selecting an
-	// id already claimed by another cluster sharing the same Proxmox VMID namespace.
-	usedVMIDs := []int64{}
+func getUsedVMIDs(ctx context.Context, scope *scope.MachineScope) (map[int64]struct{}, error) {
+	// Collect the vmids already claimed by other ProxmoxMachines. VMIDs are unique per Proxmox
+	// endpoint, which may be shared by multiple CAPI clusters, so ListProxmoxMachines returns
+	// every machine targeting this endpoint (across clusters/namespaces) - not just this
+	// cluster's - to avoid selecting an id already claimed elsewhere on the same endpoint.
 	proxmoxMachines, err := scope.InfraCluster.ListProxmoxMachines(ctx)
 	if err != nil {
-		return usedVMIDs, err
+		return nil, err
 	}
+	usedVMIDs := make(map[int64]struct{}, len(proxmoxMachines))
 	for _, proxmoxMachine := range proxmoxMachines {
-		if proxmoxMachine.GetVirtualMachineID() != -1 {
-			usedVMIDs = append(usedVMIDs, proxmoxMachine.GetVirtualMachineID())
+		if id := proxmoxMachine.GetVirtualMachineID(); id != -1 {
+			usedVMIDs[id] = struct{}{}
 		}
 	}
 	return usedVMIDs, nil

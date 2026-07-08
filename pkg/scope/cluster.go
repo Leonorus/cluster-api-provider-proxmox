@@ -222,32 +222,97 @@ func (s *ClusterScope) PatchObject() error {
 		}})
 }
 
+// listProxmoxMachines lists ProxmoxMachines with the given options.
+func (s *ClusterScope) listProxmoxMachines(ctx context.Context, opts ...client.ListOption) ([]infrav1.ProxmoxMachine, error) {
+	var machineList infrav1.ProxmoxMachineList
+	if err := s.client.List(ctx, &machineList, opts...); err != nil {
+		return nil, err
+	}
+	return machineList.Items, nil
+}
+
 // ListProxmoxMachinesForCluster returns all the ProxmoxMachines that belong to this cluster.
 func (s *ClusterScope) ListProxmoxMachinesForCluster(ctx context.Context) ([]infrav1.ProxmoxMachine, error) {
-	var machineList infrav1.ProxmoxMachineList
+	return s.listProxmoxMachines(ctx,
+		client.InNamespace(s.Namespace()),
+		client.MatchingLabels{clusterv1.ClusterNameLabel: s.Name()},
+	)
+}
 
-	err := s.client.List(ctx, &machineList, client.InNamespace(s.Namespace()), client.MatchingLabels{
-		clusterv1.ClusterNameLabel: s.Name(),
-	})
+// ListProxmoxMachines returns every ProxmoxMachine that targets the same Proxmox endpoint as
+// this cluster, across all namespaces and CAPI clusters. VMIDs are unique per Proxmox endpoint,
+// which can be shared by several CAPI clusters, so VMID allocation must consider machines
+// beyond the current cluster - but only those on the same endpoint, since ids on a different
+// Proxmox server cannot collide here. Machines whose endpoint cannot be resolved are included
+// conservatively: over-excluding a VMID is harmless, handing out a colliding one is not.
+func (s *ClusterScope) ListProxmoxMachines(ctx context.Context) ([]infrav1.ProxmoxMachine, error) {
+	machines, err := s.listProxmoxMachines(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return machineList.Items, nil
-}
-
-// ListProxmoxMachines returns every ProxmoxMachine the controller can see, across all
-// namespaces and CAPI clusters. VMIDs are unique within a whole Proxmox cluster, which can be
-// shared by several CAPI clusters, so VMID allocation must consider machines beyond the
-// current cluster to avoid handing out a colliding id.
-func (s *ClusterScope) ListProxmoxMachines(ctx context.Context) ([]infrav1.ProxmoxMachine, error) {
-	var machineList infrav1.ProxmoxMachineList
-
-	if err := s.client.List(ctx, &machineList); err != nil {
+	myEndpoint := proxmoxEndpointKey(s.ProxmoxCluster)
+	endpointByCluster, err := s.clusterEndpointKeys(ctx)
+	if err != nil {
 		return nil, err
 	}
 
-	return machineList.Items, nil
+	scoped := make([]infrav1.ProxmoxMachine, 0, len(machines))
+	for i := range machines {
+		m := machines[i]
+		key := client.ObjectKey{Namespace: m.Namespace, Name: m.Labels[clusterv1.ClusterNameLabel]}
+		if endpoint, known := endpointByCluster[key]; !known || endpoint == myEndpoint {
+			scoped = append(scoped, m)
+		}
+	}
+	return scoped, nil
+}
+
+// clusterEndpointKeys maps each CAPI cluster (by namespace/name) to the Proxmox endpoint key of
+// the ProxmoxCluster it references via its infrastructureRef.
+func (s *ClusterScope) clusterEndpointKeys(ctx context.Context) (map[client.ObjectKey]string, error) {
+	var proxmoxClusters infrav1.ProxmoxClusterList
+	if err := s.client.List(ctx, &proxmoxClusters); err != nil {
+		return nil, err
+	}
+	endpointByProxmoxCluster := make(map[client.ObjectKey]string, len(proxmoxClusters.Items))
+	for i := range proxmoxClusters.Items {
+		pc := &proxmoxClusters.Items[i]
+		endpointByProxmoxCluster[client.ObjectKey{Namespace: pc.Namespace, Name: pc.Name}] = proxmoxEndpointKey(pc)
+	}
+
+	var clusters clusterv1.ClusterList
+	if err := s.client.List(ctx, &clusters); err != nil {
+		return nil, err
+	}
+	endpointByCluster := make(map[client.ObjectKey]string, len(clusters.Items))
+	for i := range clusters.Items {
+		c := &clusters.Items[i]
+		ref := c.Spec.InfrastructureRef
+		if ref.Kind != "ProxmoxCluster" || ref.Name == "" {
+			continue
+		}
+		// A Cluster's infrastructureRef has no namespace; the ProxmoxCluster is co-located.
+		pcKey := client.ObjectKey{Namespace: c.Namespace, Name: ref.Name}
+		if endpoint, ok := endpointByProxmoxCluster[pcKey]; ok {
+			endpointByCluster[client.ObjectKey{Namespace: c.Namespace, Name: c.Name}] = endpoint
+		}
+	}
+	return endpointByCluster, nil
+}
+
+// proxmoxEndpointKey returns a stable identifier for the Proxmox endpoint a ProxmoxCluster talks
+// to. The credentialsRef (the Secret holding the Proxmox URL and token) identifies the endpoint;
+// a nil ref means the manager's default credentials, i.e. a single shared endpoint.
+func proxmoxEndpointKey(pc *infrav1.ProxmoxCluster) string {
+	if pc == nil || pc.Spec.CredentialsRef == nil {
+		return "default"
+	}
+	namespace := pc.Spec.CredentialsRef.Namespace
+	if namespace == "" {
+		namespace = pc.GetNamespace()
+	}
+	return namespace + "/" + pc.Spec.CredentialsRef.Name
 }
 
 // Close closes the current scope persisting the cluster configuration and status.
