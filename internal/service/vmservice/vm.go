@@ -556,9 +556,12 @@ func getNextFreeVMIDfromRange(ctx context.Context, scope *scope.MachineScope, vm
 }
 
 func getUsedVMIDs(ctx context.Context, scope *scope.MachineScope) ([]int64, error) {
-	// Get all used vmids from existing ProxmoxMachines
+	// Get all used vmids from existing ProxmoxMachines. VMIDs are unique across the whole
+	// Proxmox cluster, which may be shared by multiple CAPI clusters, so we must look at every
+	// ProxmoxMachine the controller can see - not just this cluster's - to avoid selecting an
+	// id already claimed by another cluster sharing the same Proxmox VMID namespace.
 	usedVMIDs := []int64{}
-	proxmoxMachines, err := scope.InfraCluster.ListProxmoxMachinesForCluster(ctx)
+	proxmoxMachines, err := scope.InfraCluster.ListProxmoxMachines(ctx)
 	if err != nil {
 		return usedVMIDs, err
 	}

@@ -390,6 +390,43 @@ func TestEnsureVirtualMachine_CreateVM_VMIDRangeCheckExisting(t *testing.T) {
 	require.Equal(t, int64(1002), machineScope.ProxmoxMachine.GetVirtualMachineID())
 }
 
+// TestEnsureVirtualMachine_CreateVM_VMIDRangeSkipsOtherCluster verifies that VMID selection
+// excludes ids already claimed by ProxmoxMachines in *other* CAPI clusters / namespaces that
+// share the same Proxmox VMID namespace (issue #842). The foreign machine holds 1000, so the
+// range selection must skip it and pick 1001.
+func TestEnsureVirtualMachine_CreateVM_VMIDRangeSkipsOtherCluster(t *testing.T) {
+	machineScope, proxmoxClient, kubeClient := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
+	machineScope.ProxmoxMachine.Spec.VMIDRange = &infrav1.VMIDRange{
+		Start: 1000,
+		End:   1002,
+	}
+
+	// A ProxmoxMachine belonging to a different cluster in a different namespace, holding an
+	// in-range VMID. It must be considered "used" even though it is not in this cluster.
+	foreign := &infrav1.ProxmoxMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foreign",
+			Namespace: "other-ns",
+			Labels:    map[string]string{"cluster.x-k8s.io/cluster-name": "other"},
+		},
+		Spec: infrav1.ProxmoxMachineSpec{
+			VirtualMachineID: ptr.To(int64(1000)),
+		},
+	}
+	require.NoError(t, kubeClient.Create(context.Background(), foreign))
+
+	expectedOptions := proxmox.VMCloneRequest{Node: "node1", NewID: 1001, Name: "test", Full: 1}
+	response := proxmox.VMCloneResponse{Task: newTask(), NewID: int64(1001)}
+	// 1000 is skipped via the used-set (no CheckID call); 1001 is checked and free.
+	proxmoxClient.Mock.On("CheckID", context.Background(), int64(1001)).Return(true, nil).Once()
+	proxmoxClient.EXPECT().CloneVM(context.Background(), 123, expectedOptions).Return(response, nil).Once()
+
+	requeue, err := ensureVirtualMachine(context.Background(), machineScope)
+	require.NoError(t, err)
+	require.True(t, requeue)
+	require.Equal(t, int64(1001), machineScope.ProxmoxMachine.GetVirtualMachineID())
+}
+
 func TestEnsureVirtualMachine_FindVM(t *testing.T) {
 	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
 	machineScope.SetVirtualMachineID(123)

@@ -236,6 +236,20 @@ func (s *ClusterScope) ListProxmoxMachinesForCluster(ctx context.Context) ([]inf
 	return machineList.Items, nil
 }
 
+// ListProxmoxMachines returns every ProxmoxMachine the controller can see, across all
+// namespaces and CAPI clusters. VMIDs are unique within a whole Proxmox cluster, which can be
+// shared by several CAPI clusters, so VMID allocation must consider machines beyond the
+// current cluster to avoid handing out a colliding id.
+func (s *ClusterScope) ListProxmoxMachines(ctx context.Context) ([]infrav1.ProxmoxMachine, error) {
+	var machineList infrav1.ProxmoxMachineList
+
+	if err := s.client.List(ctx, &machineList); err != nil {
+		return nil, err
+	}
+
+	return machineList.Items, nil
+}
+
 // Close closes the current scope persisting the cluster configuration and status.
 func (s *ClusterScope) Close() error {
 	return s.PatchObject()

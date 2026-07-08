@@ -102,10 +102,35 @@ func updateVMLocation(ctx context.Context, s *scope.MachineScope) error {
 	}
 
 	// If there is a machine with an ID that doesn't match name of the
-	// Proxmox machine, we need to stop right there.
+	// Proxmox machine, the chosen VMID belongs to a different VM.
 	machineName := s.ProxmoxMachine.GetName()
 	if vm.VirtualMachineConfig.Name != machineName {
-		err := fmt.Errorf("expected VM name to match %q but it was %q", vm.Name, machineName)
+		err := fmt.Errorf("expected VM name to match %q but it was %q", machineName, vm.VirtualMachineConfig.Name)
+
+		// If we have never adopted a VM (no providerID), this is a VMID collision: two
+		// reconciles sharing one Proxmox VMID namespace selected the same id and the other
+		// won the race. Treat it as recoverable — release the id, reset the state machine to
+		// Cloning (non-terminal, so HasFailed stays false) and return a transient error so
+		// the controller requeues with backoff. The next reconcile re-selects a fresh id.
+		// TaskRef is guaranteed nil here (see the early return above), so only the id and
+		// the (stale) node location need clearing.
+		if s.ProxmoxMachine.Spec.ProviderID == "" {
+			s.Logger.Info("VMID collision detected, releasing id and requeueing for re-selection",
+				"vmID", vmID, "conflictingVM", vm.VirtualMachineConfig.Name)
+			s.ClearVirtualMachineID()
+			s.ProxmoxMachine.Status.ProxmoxNode = nil
+			conditions.Set(s.ProxmoxMachine, metav1.Condition{
+				Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
+				Message: err.Error(),
+			})
+			return err
+		}
+
+		// We had already adopted a VM at this id but its name no longer matches. This is not a
+		// benign allocation race; surface it as a terminal failure for operator attention
+		// (preserves the anti-adoption guard against cross-cluster VM takeover).
 		conditions.Set(s.ProxmoxMachine, metav1.Condition{
 			Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
 			Status:  metav1.ConditionFalse,

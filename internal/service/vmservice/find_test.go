@@ -104,6 +104,10 @@ func TestUpdateVMLocation_MissingName(t *testing.T) {
 	require.Error(t, updateVMLocation(ctx, machineScope))
 }
 
+// TestUpdateVMLocation_NameMismatch covers a VMID collision: the id resolves to a VM owned by
+// a different machine and we have not adopted a VM yet (no providerID). This must be treated as
+// recoverable - the id is released and the machine requeues to select a fresh one - rather than
+// latching a terminal failure.
 func TestUpdateVMLocation_NameMismatch(t *testing.T) {
 	ctx := context.TODO()
 	machineScope, proxmoxClient, _ := setupReconcilerTest(t)
@@ -113,13 +117,18 @@ func TestUpdateVMLocation_NameMismatch(t *testing.T) {
 	vmr.Name = name
 	vm.VirtualMachineConfig.Name = name
 	machineScope.ProxmoxMachine.Spec.VirtualMachineID = new(int64(vm.VMID))
+	machineScope.ProxmoxMachine.Status.ProxmoxNode = new("node1")
 
 	proxmoxClient.EXPECT().FindVMResource(ctx, uint64(123)).Return(vmr, nil).Once()
 	proxmoxClient.EXPECT().GetVM(ctx, "node1", int64(123)).Return(vm, nil).Once()
 
+	// Transient error so the controller requeues, but not a terminal failure.
 	require.Error(t, updateVMLocation(ctx, machineScope))
+	require.False(t, machineScope.HasFailed())
 	requireConditionIsFalse(t, machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
-	require.True(t, machineScope.HasFailed())
+	// The colliding id and stale node location are released for re-selection.
+	require.Equal(t, int64(-1), machineScope.GetVirtualMachineID())
+	require.Nil(t, machineScope.ProxmoxMachine.Status.ProxmoxNode)
 }
 
 func TestUpdateVMLocation_UpdateNode(t *testing.T) {
@@ -152,7 +161,11 @@ func TestUpdateVMLocation_WithTask(t *testing.T) {
 	require.Error(t, updateVMLocation(context.TODO(), machineScope))
 }
 
-func TestUpdateVMLocation_WithoutTaskNameMismatch(t *testing.T) {
+// TestUpdateVMLocation_NameMismatchAdopted covers a machine that had already adopted a VM
+// (providerID set) whose name no longer matches. This is not a benign allocation race, so it
+// must stay a terminal failure for operator attention (anti-adoption guard), and the id must
+// NOT be released.
+func TestUpdateVMLocation_NameMismatchAdopted(t *testing.T) {
 	ctx := context.TODO()
 	machineScope, proxmoxClient, _ := setupReconcilerTest(t)
 	vm := newRunningVM()
@@ -162,6 +175,7 @@ func TestUpdateVMLocation_WithoutTaskNameMismatch(t *testing.T) {
 	vm.VirtualMachineConfig.Name = name
 	machineScope.ProxmoxMachine.Spec.VirtualMachineID = new(int64(vm.VMID))
 	machineScope.ProxmoxMachine.Status.TaskRef = nil
+	machineScope.ProxmoxMachine.Spec.ProviderID = "proxmox://some-uuid"
 
 	proxmoxClient.EXPECT().FindVMResource(ctx, uint64(123)).Return(vmr, nil).Once()
 	proxmoxClient.EXPECT().GetVM(ctx, "node1", int64(123)).Return(vm, nil).Once()
@@ -169,4 +183,6 @@ func TestUpdateVMLocation_WithoutTaskNameMismatch(t *testing.T) {
 	require.Error(t, updateVMLocation(ctx, machineScope))
 	requireConditionIsFalse(t, machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
 	require.True(t, machineScope.HasFailed())
+	// The id is retained; this needs manual intervention.
+	require.Equal(t, int64(123), machineScope.GetVirtualMachineID())
 }

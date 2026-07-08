@@ -373,6 +373,45 @@ spec:
             defaultIPv4: true
 ```
 
+## VMID allocation and shared Proxmox clusters
+
+Every VM in a Proxmox cluster has a unique numeric VMID. By default capmox lets Proxmox pick
+the next free VMID at clone time. When a **single Proxmox cluster is shared by several CAPI
+clusters** (one management controller provisioning many workload clusters onto the same nodes),
+this shared VMID namespace can produce collisions: two `ProxmoxMachine` objects that are
+provisioned at nearly the same time — e.g. concurrent rolling upgrades across clusters — may be
+handed the **same** VMID before either clone has registered with Proxmox.
+
+capmox self-heals from such a collision: the machine that loses the race releases the colliding
+VMID and re-selects a fresh one on the next reconcile, rather than getting stuck. You may still
+see a transient `Cloning` blip and a re-selected `virtualMachineID` in that machine's status.
+
+To avoid collisions entirely, assign each `ProxmoxMachineTemplate` a **non-overlapping**
+`vmIDRange`. VMID selection within a range considers every `ProxmoxMachine` the controller can
+see across all CAPI clusters, so disjoint ranges guarantee no two clusters ever contend for the
+same ID:
+
+```diff
+kind: ProxmoxMachineTemplate
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+metadata:
+  name: "cluster-a-worker"
+spec:
+  template:
+    spec:
+      sourceNode: "pve"
+      templateID: 1000
++     # Give each cluster (or each template) its own disjoint band of VMIDs.
++     vmIDRange:
++       start: 1000
++       end: 1999
+```
+
+> **Note:** a wedged surge machine is amplified by `MachineDeployment.spec.strategy.rollingUpdate.maxUnavailable: 0`,
+> because the rollout will not progress until the new machine becomes Ready. Non-overlapping
+> `vmIDRange` values per cluster are the most robust way to keep concurrent multi-cluster rolls
+> collision-free.
+
 ## Notes
 
 * Clusters with IPV6 only is supported.

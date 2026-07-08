@@ -93,6 +93,11 @@ func TestMachineScope_GetVirtualMachineID(t *testing.T) {
 
 	scope.SetVirtualMachineID(100)
 	require.Equal(t, scope.GetVirtualMachineID(), int64(100))
+
+	// Releasing the id (e.g. after a VMID collision) reverts to the unset sentinel.
+	scope.ClearVirtualMachineID()
+	require.Nil(t, scope.ProxmoxMachine.Spec.VirtualMachineID)
+	require.Equal(t, scope.GetVirtualMachineID(), int64(-1))
 }
 
 func TestMachineScope_SetReady(t *testing.T) {

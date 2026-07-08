@@ -164,6 +164,14 @@ func (m *MachineScope) SetVirtualMachineID(vmID int64) {
 	m.ProxmoxMachine.Spec.VirtualMachineID = new(vmID)
 }
 
+// ClearVirtualMachineID unsets spec.virtualMachineID so a fresh id is selected on the next
+// reconcile. Used to recover from a VMID collision where the chosen id turned out to belong
+// to a different VM. GetVirtualMachineID then reports -1 and FindVM/getUsedVMIDs treat the
+// machine as not-yet-created.
+func (m *MachineScope) ClearVirtualMachineID() {
+	m.ProxmoxMachine.Spec.VirtualMachineID = nil
+}
+
 // SetReady sets the ProxmoxMachine Ready Status.
 func (m *MachineScope) SetReady() {
 	m.ProxmoxMachine.Status.Initialization.Provisioned = new(true)
