@@ -125,6 +125,45 @@ func TestFindVM_NotInitializedPlaceholderName(t *testing.T) {
 	require.ErrorIs(t, err, ErrVMNotInitialized)
 }
 
+// TestFindVM_AdoptedMatchesByUUIDDespiteRename covers an already-adopted machine (providerID set)
+// whose VM was renamed out of band: identity is the BIOS UUID, not the name, so a rename must not
+// be mistaken for a collision (which would destructively re-roll and orphan the VM).
+func TestFindVM_AdoptedMatchesByUUIDDespiteRename(t *testing.T) {
+	ctx := context.TODO()
+	machineScope, proxmoxClient, _ := setupReconcilerTest(t)
+	const vmUUID = "56603c36-46b9-4608-90ae-c731c15eae64"
+	vm := newRunningVM()
+	vm.Name = "renamed-out-of-band"
+	vm.VirtualMachineConfig.SMBios1 = "uuid=" + vmUUID
+	machineScope.ProxmoxMachine.Spec.VirtualMachineID = ptr.To(int64(vm.VMID))
+	machineScope.ProxmoxMachine.Status.ProxmoxNode = ptr.To("node2")
+	machineScope.ProxmoxMachine.Spec.ProviderID = "proxmox://" + vmUUID
+
+	proxmoxClient.EXPECT().GetVM(ctx, "node2", int64(123)).Return(vm, nil).Once()
+
+	got, err := FindVM(ctx, machineScope)
+	require.NoError(t, err)
+	require.Equal(t, vm, got)
+}
+
+// TestFindVM_AdoptedCollisionWhenUUIDDiffers covers an adopted machine whose id now resolves to a
+// VM with a different UUID, even though its name happens to match this machine: UUID identity wins,
+// so it is reported as a collision.
+func TestFindVM_AdoptedCollisionWhenUUIDDiffers(t *testing.T) {
+	ctx := context.TODO()
+	machineScope, proxmoxClient, _ := setupReconcilerTest(t)
+	vm := newRunningVM() // name "test" matches the machine, but a different UUID must win
+	vm.VirtualMachineConfig.SMBios1 = "uuid=00000000-0000-0000-0000-000000000000"
+	machineScope.ProxmoxMachine.Spec.VirtualMachineID = ptr.To(int64(vm.VMID))
+	machineScope.ProxmoxMachine.Status.ProxmoxNode = ptr.To("node2")
+	machineScope.ProxmoxMachine.Spec.ProviderID = "proxmox://56603c36-46b9-4608-90ae-c731c15eae64"
+
+	proxmoxClient.EXPECT().GetVM(ctx, "node2", int64(123)).Return(vm, nil).Once()
+
+	_, err := FindVM(ctx, machineScope)
+	require.ErrorIs(t, err, ErrVMIDCollision)
+}
+
 func TestUpdateVMLocation_MissingName(t *testing.T) {
 	ctx := context.TODO()
 	machineScope, proxmoxClient, _ := setupReconcilerTest(t)

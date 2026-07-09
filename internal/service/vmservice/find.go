@@ -19,6 +19,7 @@ package vmservice
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/luthermonson/go-proxmox"
 	"github.com/pkg/errors"
@@ -54,6 +55,35 @@ func placeholderVMName(vmID int64) string {
 	return fmt.Sprintf("VM %d", vmID)
 }
 
+// vmIdentityMatches reports whether vm is the VM this machine owns, and whether it is still
+// initializing (so a mismatch means "wait", not "collision"). name is the VM name field the caller
+// observed (status name for FindVM, config name for updateVMLocation).
+//
+// Once a machine has adopted a VM, its identity is the BIOS UUID recorded in spec.providerID, not
+// the name: an operator or Proxmox tooling can rename a VM without changing what it is, and a
+// rename must not trigger a destructive re-roll. Before adoption there is no UUID yet, so the name
+// set at clone time is the only link; an empty or placeholder name means the clone is still
+// initializing.
+func vmIdentityMatches(vm *proxmox.VirtualMachine, name string, s *scope.MachineScope) (matches, initializing bool) {
+	// Use UUID identity only once providerID carries a real UUID; "proxmox://" with an empty UUID
+	// (a VM with no readable BIOS UUID) falls back to name matching below.
+	if want := strings.TrimPrefix(s.ProxmoxMachine.Spec.ProviderID, "proxmox://"); want != "" {
+		got := ""
+		if vm.VirtualMachineConfig != nil {
+			got = extractUUID(vm.VirtualMachineConfig.SMBios1)
+		}
+		if got == "" {
+			// The adopted VM's UUID is not readable yet; wait rather than declare a collision.
+			return false, true
+		}
+		return got == want, false
+	}
+	if name == "" || name == placeholderVMName(s.GetVirtualMachineID()) {
+		return false, true
+	}
+	return name == s.ProxmoxMachine.GetName(), false
+}
+
 // FindVM returns the Proxmox VM if the vmID is set, otherwise
 // returns ErrVMNotCreated or ErrVMNotFound if the VM doesn't exist.
 func FindVM(ctx context.Context, scope *scope.MachineScope) (*proxmox.VirtualMachine, error) {
@@ -67,18 +97,15 @@ func FindVM(ctx context.Context, scope *scope.MachineScope) (*proxmox.VirtualMac
 			scope.Error(err, "unable to find vm")
 			return nil, ErrVMNotFound
 		}
-		// A freshly-cloned VM may not have its final name yet; wait for it. Proxmox reports an
-		// as-yet-unnamed VM with the placeholder "VM <vmid>" (not an empty string) until the
-		// clone finishes applying the requested name, so treat that placeholder the same as an
-		// empty name. Declaring a collision here would be a false positive against this machine's
-		// own in-flight clone and would orphan it when the id is released and re-rolled.
-		if vm.Name == "" || vm.Name == placeholderVMName(vmID) {
+		// Decide identity by UUID once adopted, else by name (placeholder/empty name means the
+		// clone is still initializing). A mismatch means the id resolves to a different machine's
+		// VM: a VMID collision, handled by the caller via handleVMIDCollision.
+		matches, initializing := vmIdentityMatches(vm, vm.Name, scope)
+		if initializing {
 			scope.Info("vm is not initialized yet")
 			return nil, ErrVMNotInitialized
 		}
-		// A real name that is not ours means the id resolves to a different machine's VM:
-		// a VMID collision (handled by the caller via handleVMIDCollision).
-		if vm.Name != scope.ProxmoxMachine.GetName() {
+		if !matches {
 			return nil, fmt.Errorf("vmid %d resolves to VM %q, expected %q: %w",
 				vmID, vm.Name, scope.ProxmoxMachine.GetName(), ErrVMIDCollision)
 		}
@@ -121,16 +148,16 @@ func updateVMLocation(ctx context.Context, s *scope.MachineScope) error {
 	// It might happen that even when a task is already finished,
 	// we still have to wait until we can get the correct
 	// information for a particular resource.
-	if vm.VirtualMachineConfig.Name == "" || vm.VirtualMachineConfig.Name == placeholderVMName(vmID) {
+	// Decide identity by UUID once adopted, else by config name. If the id resolves cluster-wide
+	// to a different VM, report it as a collision; the caller decides whether to recover or fail
+	// (see handleVMIDCollision). This keeps collision handling in one place, reachable from every
+	// detection path.
+	matches, initializing := vmIdentityMatches(vm, vm.VirtualMachineConfig.Name, s)
+	if initializing {
 		return errors.New("vm exists but does not have a name yet")
 	}
-
-	// If we locate the VM cluster-wide but its name doesn't match this machine, the chosen
-	// VMID belongs to a different VM. Report it as a collision; the caller decides whether to
-	// recover or fail (see handleVMIDCollision). This keeps collision handling in one place,
-	// reachable from every detection path.
 	machineName := s.ProxmoxMachine.GetName()
-	if vm.VirtualMachineConfig.Name != machineName {
+	if !matches {
 		return fmt.Errorf("vmid %d resolves to VM %q, expected %q: %w",
 			vmID, vm.VirtualMachineConfig.Name, machineName, ErrVMIDCollision)
 	}
