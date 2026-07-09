@@ -404,7 +404,7 @@ against every range:
 
 ```diff
 kind: ProxmoxMachineTemplate
-apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha2
 metadata:
   name: "cluster-a-worker"
 spec:

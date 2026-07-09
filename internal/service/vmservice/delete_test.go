@@ -102,6 +102,40 @@ func TestDeleteVM_NotFoundAndVMIDLookupErrorKeepsFinalizer(t *testing.T) {
 	require.Contains(t, cond.Message, "temporary resource lookup failure")
 }
 
+// TestDeleteVM_NotFoundAndVMIDPlaceholderNameKeepsFinalizer covers the ownership check meeting
+// Proxmox's placeholder name "VM <vmid>" for a still-nameless VM: it is not provably foreign, so
+// deletion must not complete (dropping the finalizer would orphan the machine's own half-created
+// VM). Keep the finalizer and requeue.
+func TestDeleteVM_NotFoundAndVMIDPlaceholderNameKeepsFinalizer(t *testing.T) {
+	machineScope, proxmoxClient := setupDeleteVMTest(t)
+	placeholder := &proxmox.ClusterResource{Name: placeholderVMName(123), Node: "node1", VMID: 123}
+
+	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: stale node location")).Once()
+	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
+	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(placeholder, nil).Once()
+
+	require.NoError(t, DeleteVM(context.TODO(), machineScope))
+	requireDeleteBlockedOnVMID(t, machineScope)
+}
+
+// TestDeleteVM_NotFoundButVMMigratedRelocatesAndKeepsFinalizer covers a VM that is still ours but
+// has moved off the recorded node (HA failover / live migration): the destroy at the stale node
+// reports not found while the id resolves cluster-wide to our VM on a different node. Deletion must
+// adopt that node so the next reconcile retries the destroy there, rather than looping forever.
+func TestDeleteVM_NotFoundButVMMigratedRelocatesAndKeepsFinalizer(t *testing.T) {
+	machineScope, proxmoxClient := setupDeleteVMTest(t)
+	migrated := &proxmox.ClusterResource{Name: machineScope.Name(), Node: "node2", VMID: 123}
+
+	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: stale node location")).Once()
+	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
+	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(migrated, nil).Once()
+
+	require.NoError(t, DeleteVM(context.TODO(), machineScope))
+	require.Contains(t, machineScope.ProxmoxMachine.Finalizers, infrav1.MachineFinalizer)
+	require.NotNil(t, machineScope.ProxmoxMachine.Status.ProxmoxNode)
+	require.Equal(t, "node2", *machineScope.ProxmoxMachine.Status.ProxmoxNode)
+}
+
 // TestDeleteVM_DestroyTaskFailedButVMIDReusedByForeignVMCompletesDeletion covers the same
 // ownership check on the in-flight-task path: a failed destroy task whose id has since been reused
 // by a foreign VM must complete deletion rather than latch DeletionFailed forever.

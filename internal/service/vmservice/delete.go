@@ -205,30 +205,41 @@ func completeIfVMIDFree(ctx context.Context, machineScope *scope.MachineScope, v
 	// or another cluster's VM sharing the Proxmox VMID namespace - a race that VMID-collision
 	// recovery makes more likely by deliberately releasing ids for reuse. Gating the finalizer on
 	// freeness alone therefore deadlocks: once the id is reused it never reads free again. Resolve
-	// the VM now holding the id and compare its name (the same ownership test FindVM uses). Only a
-	// VM that is still ours keeps the finalizer; a foreign name means our VM is gone and this
-	// deletion is complete. completeVMDeletion never destroys a VM, so this cannot touch the
-	// foreign one.
-	owned, err := vmIDOwnedByMachine(ctx, machineScope, vmID)
+	// the VM now holding the id cluster-wide and decide by ownership.
+	rsc, err := machineScope.InfraCluster.ProxmoxClient.FindVMResource(ctx, uint64(vmID))
 	if err != nil {
 		setDeletingCondition(machineScope, checkIDErrorMessage(vmID, verificationContext, err))
 		return false, checkIDError(vmID, verificationContext, err)
 	}
-	if !owned {
+	if vmResourceIsForeign(rsc, machineScope.Name()) {
+		// A foreign name means our VM is gone and the id has been reused; this deletion is
+		// complete. completeVMDeletion never destroys a VM, so this cannot touch the foreign one.
 		return true, completeVMDeletion(machineScope)
+	}
+
+	// The VM at our id is still ours (or unnamed/initializing and so not provably foreign - see
+	// vmResourceIsForeign). It may have moved off Status.ProxmoxNode since that was recorded (HA
+	// failover / live migration), which is why the destroy at the stale node reported not found.
+	// Adopt the id's current node so the next reconcile retries the destroy there instead of
+	// looping forever on the stale node. Keep the finalizer until the VM is actually gone.
+	if rsc.Node != "" && machineScope.LocateProxmoxNode() != rsc.Node {
+		machineScope.ProxmoxMachine.Status.ProxmoxNode = new(rsc.Node)
+		machineScope.InfraCluster.ProxmoxCluster.UpdateNodeLocation(
+			machineScope.Name(), rsc.Node, util.IsControlPlaneMachine(machineScope.Machine))
 	}
 	return false, nil
 }
 
-// vmIDOwnedByMachine reports whether the VM currently holding vmID belongs to this machine, by
-// comparing the cluster-wide resource name to the machine name - the same ownership test FindVM
-// uses. A foreign or empty name means our VM is gone and the id has been reused by another VM.
-func vmIDOwnedByMachine(ctx context.Context, machineScope *scope.MachineScope, vmID int64) (bool, error) {
-	rsc, err := machineScope.InfraCluster.ProxmoxClient.FindVMResource(ctx, uint64(vmID))
-	if err != nil {
-		return false, err
+// vmResourceIsForeign reports whether the cluster resource holding our VMID is definitively a
+// different machine's VM. It is foreign only when it carries a real, non-placeholder name that is
+// not ours. An empty or placeholder ("VM <vmid>") name belongs to an unnamed/initializing VM that
+// cannot be proven foreign, so it is treated as possibly-ours - the safe side, since acting on a
+// false "foreign" verdict would orphan our own half-created VM by dropping the finalizer.
+func vmResourceIsForeign(rsc *proxmox.ClusterResource, machineName string) bool {
+	if rsc.Name == "" || rsc.Name == placeholderVMName(int64(rsc.VMID)) {
+		return false
 	}
-	return rsc.Name == machineScope.Name(), nil
+	return rsc.Name != machineName
 }
 
 func checkIDErrorMessage(vmID int64, verificationContext string, err error) string {
