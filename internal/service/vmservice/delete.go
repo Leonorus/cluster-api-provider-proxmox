@@ -196,10 +196,39 @@ func completeIfVMIDFree(ctx context.Context, machineScope *scope.MachineScope, v
 		setDeletingCondition(machineScope, checkIDErrorMessage(vmID, verificationContext, err))
 		return false, checkIDError(vmID, verificationContext, err)
 	}
-	if !vmIDFree {
-		return false, nil
+	if vmIDFree {
+		return true, completeVMDeletion(machineScope)
 	}
-	return true, completeVMDeletion(machineScope)
+
+	// CheckID reports cluster-wide freeness, not ownership: the id being in use does not mean
+	// our VM still exists. It may have been destroyed and the id already reused by a replacement
+	// or another cluster's VM sharing the Proxmox VMID namespace - a race that VMID-collision
+	// recovery makes more likely by deliberately releasing ids for reuse. Gating the finalizer on
+	// freeness alone therefore deadlocks: once the id is reused it never reads free again. Resolve
+	// the VM now holding the id and compare its name (the same ownership test FindVM uses). Only a
+	// VM that is still ours keeps the finalizer; a foreign name means our VM is gone and this
+	// deletion is complete. completeVMDeletion never destroys a VM, so this cannot touch the
+	// foreign one.
+	owned, err := vmIDOwnedByMachine(ctx, machineScope, vmID)
+	if err != nil {
+		setDeletingCondition(machineScope, checkIDErrorMessage(vmID, verificationContext, err))
+		return false, checkIDError(vmID, verificationContext, err)
+	}
+	if !owned {
+		return true, completeVMDeletion(machineScope)
+	}
+	return false, nil
+}
+
+// vmIDOwnedByMachine reports whether the VM currently holding vmID belongs to this machine, by
+// comparing the cluster-wide resource name to the machine name - the same ownership test FindVM
+// uses. A foreign or empty name means our VM is gone and the id has been reused by another VM.
+func vmIDOwnedByMachine(ctx context.Context, machineScope *scope.MachineScope, vmID int64) (bool, error) {
+	rsc, err := machineScope.InfraCluster.ProxmoxClient.FindVMResource(ctx, uint64(vmID))
+	if err != nil {
+		return false, err
+	}
+	return rsc.Name == machineScope.Name(), nil
 }
 
 func checkIDErrorMessage(vmID int64, verificationContext string, err error) string {

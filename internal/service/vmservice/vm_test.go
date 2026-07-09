@@ -419,7 +419,7 @@ func TestEnsureVirtualMachine_CreateVM_VMIDRangeSkipsOtherCluster(t *testing.T) 
 	}
 	require.NoError(t, kubeClient.Create(context.Background(), foreign))
 
-	expectedOptions := proxmox.VMCloneRequest{Node: "node1", NewID: 1001, Name: "test", Full: 1}
+	expectedOptions := proxmox.VMCloneRequest{Node: "node1", NewID: 1001, Name: "test", Full: true}
 	response := proxmox.VMCloneResponse{Task: newTask(), NewID: int64(1001)}
 	// 1000 is skipped via the used-set (no CheckID call); 1001 is checked and free.
 	proxmoxClient.Mock.On("CheckID", context.Background(), int64(1001)).Return(true, nil).Once()
@@ -473,7 +473,7 @@ func TestEnsureVirtualMachine_CreateVM_VMIDRangeIgnoresOtherEndpoint(t *testing.
 	require.NoError(t, kubeClient.Create(context.Background(), otherCluster))
 	require.NoError(t, kubeClient.Create(context.Background(), foreign))
 
-	expectedOptions := proxmox.VMCloneRequest{Node: "node1", NewID: 1000, Name: "test", Full: 1}
+	expectedOptions := proxmox.VMCloneRequest{Node: "node1", NewID: 1000, Name: "test", Full: true}
 	response := proxmox.VMCloneResponse{Task: newTask(), NewID: int64(1000)}
 	// 1000 is on a different endpoint, so it is NOT skipped: it is checked and found free.
 	proxmoxClient.Mock.On("CheckID", context.Background(), int64(1000)).Return(true, nil).Once()
