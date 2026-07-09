@@ -142,48 +142,54 @@ func updateVMLocation(ctx context.Context, s *scope.MachineScope) error {
 
 // handleVMIDCollision reacts to a detected VMID collision (cause wraps ErrVMIDCollision).
 //
-// It self-heals only a controller-selected id that has not been adopted yet: two reconciles
-// sharing one Proxmox VMID namespace selected the same id and the other won the race. In that
-// case it releases the id and resets the state machine to Cloning (non-terminal), so the next
-// reconcile selects a fresh one. Re-selection provably skips occupied ids (Proxmox nextid
+// It self-heals only an id the controller itself allocated and has not adopted yet: two
+// reconciles sharing one Proxmox VMID namespace selected the same id and the other won the race.
+// In that case it releases the id and resets the state machine to Cloning (non-terminal), so the
+// next reconcile selects a fresh one. Re-selection provably skips occupied ids (Proxmox nextid
 // advances, and the range path CheckID-skips taken ids, failing terminally on exhaustion), so
-// this converges rather than looping.
+// this converges rather than looping. Provenance is the VMIDAllocatedByControllerAnnotation set
+// at allocation time, an explicit signal that (unlike Status.ProxmoxNode) is never set for an
+// operator-pinned id.
 //
-// It stays terminal (VMProvisionFailed, so MachineHealthCheck can remediate) when either:
-//   - providerID is set: we already adopted a VM at this id and its name changed — operator
-//     -worthy, and never silently abandon an adopted VM (anti-adoption guard); or
-//   - Status.ProxmoxNode is nil: createVM never ran for this machine, so the id was pinned by
-//     an operator (or otherwise set externally) rather than allocated by the controller;
-//     clobbering it would violate intent.
-//
-// The returned error is always the (transient) cause, so the controller requeues; the terminal
-// path additionally latches HasFailed so the next reconcile short-circuits.
+// For every other case - an operator-pinned id (no annotation) or an already-adopted VM
+// (providerID set) whose name no longer matches - it neither releases the id (that would violate
+// operator intent / abandon an adopted VM) nor latches a terminal VMProvisionFailed. A terminal
+// failure would let MachineHealthCheck remediate by deleting the Machine, and DeleteVM removes
+// purely by VMID with no ownership check, so it could destroy a VM this machine does not own.
+// Instead it surfaces a visible, non-terminal condition and requeues so an operator can resolve
+// the conflict without the controller autonomously deleting anything.
 func handleVMIDCollision(s *scope.MachineScope, cause error) error {
-	if s.ProxmoxMachine.Spec.ProviderID != "" || s.ProxmoxMachine.Status.ProxmoxNode == nil {
+	controllerAllocated := s.ProxmoxMachine.Annotations[infrav1.VMIDAllocatedByControllerAnnotation] == "true"
+	if s.ProxmoxMachine.Spec.ProviderID != "" || !controllerAllocated {
+		s.Logger.Info("VMID collision on a pinned or already-adopted id; requeueing without releasing it",
+			"vmID", s.GetVirtualMachineID(), "cause", cause.Error())
 		conditions.Set(s.ProxmoxMachine, metav1.Condition{
 			Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
 			Status:  metav1.ConditionFalse,
-			Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedVMProvisionFailedReason,
+			Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
 			Message: cause.Error(),
 		})
 		return cause
 	}
 
-	s.Logger.Info("VMID collision detected, releasing id and requeueing for re-selection",
+	s.Logger.Info("VMID collision detected, releasing controller-allocated id and requeueing for re-selection",
 		"vmID", s.GetVirtualMachineID(), "cause", cause.Error())
+	// Persist the cluster-status change first; only mutate the machine once it succeeds. Dropping
+	// the stale node location keeps a later AddNodeLocation on re-clone from being a no-op
+	// (AddNodeLocation skips machines it already knows). Ordering it before the machine mutations
+	// means a failed cluster patch cannot leave the id released while a stale NodeLocation lingers.
+	s.InfraCluster.ProxmoxCluster.RemoveNodeLocation(s.ProxmoxMachine.GetName(), util.IsControlPlaneMachine(s.Machine))
+	if err := s.InfraCluster.PatchObject(); err != nil {
+		return err
+	}
 	s.ClearVirtualMachineID()
 	s.ProxmoxMachine.Status.ProxmoxNode = nil
-	// Drop the stale cluster-status node location so a later AddNodeLocation on re-clone is not
-	// a no-op (AddNodeLocation skips machines it already knows).
-	s.InfraCluster.ProxmoxCluster.RemoveNodeLocation(s.ProxmoxMachine.GetName(), util.IsControlPlaneMachine(s.Machine))
+	delete(s.ProxmoxMachine.Annotations, infrav1.VMIDAllocatedByControllerAnnotation)
 	conditions.Set(s.ProxmoxMachine, metav1.Condition{
 		Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
 		Status:  metav1.ConditionFalse,
 		Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
 		Message: cause.Error(),
 	})
-	if err := s.InfraCluster.PatchObject(); err != nil {
-		return err
-	}
 	return cause
 }

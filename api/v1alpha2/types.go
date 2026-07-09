@@ -50,6 +50,12 @@ const (
 
 	// ProxmoxDefaultGatewayAnnotation marks an IPAddress spec as containing a default gateway.
 	ProxmoxDefaultGatewayAnnotation string = "ipam.capmox.cluster.x-k8s.io/default-gateway"
+
+	// VMIDAllocatedByControllerAnnotation marks a ProxmoxMachine whose spec.virtualMachineID was
+	// selected by the controller (via getVMID/CloneVM) rather than pinned by an operator. It is
+	// the provenance signal that lets VMID-collision recovery release and re-roll only ids the
+	// controller owns, never an operator-pinned one.
+	VMIDAllocatedByControllerAnnotation string = "vmid.capmox.cluster.x-k8s.io/allocated-by-controller"
 )
 
 // VirtualMachine represents data about a Proxmox virtual machine object.

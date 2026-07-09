@@ -144,6 +144,8 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions(t *testing.T) {
 	require.Equal(t, "node2", *machineScope.ProxmoxMachine.Status.ProxmoxNode)
 	require.True(t, machineScope.InfraCluster.ProxmoxCluster.HasMachine(machineScope.Name(), false))
 	requireConditionIsFalse(t, machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
+	// The controller allocated this id, so it must be marked as such for collision recovery.
+	require.Equal(t, "true", machineScope.ProxmoxMachine.Annotations[infrav1.VMIDAllocatedByControllerAnnotation])
 }
 
 func TestEnsureVirtualMachine_CreateVM_FullOptions_TemplateSelector(t *testing.T) {

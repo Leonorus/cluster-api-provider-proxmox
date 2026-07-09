@@ -244,6 +244,9 @@ func ensureVirtualMachine(ctx context.Context, machineScope *scope.MachineScope)
 		// make sure spec.VirtualMachineID is always set.
 		machineScope.ProxmoxMachine.Status.TaskRef = new(string(resp.Task.UPID))
 		machineScope.SetVirtualMachineID(resp.NewID)
+		// Record that the controller (not an operator) allocated this id, so a later VMID
+		// collision on it can be safely self-healed by re-rolling.
+		machineScope.SetAnnotation(infrav1.VMIDAllocatedByControllerAnnotation, "true")
 
 		// requeue until cloning is finished
 		return true, nil

@@ -175,14 +175,15 @@ func TestUpdateVMLocation_WithTask(t *testing.T) {
 	require.Error(t, updateVMLocation(context.TODO(), machineScope))
 }
 
-// TestHandleVMIDCollision_Recovers covers a controller-selected, not-yet-adopted id (empty
-// providerID, ProxmoxNode recorded by createVM): the collision is a benign allocation race and
-// must self-heal - release the id and stale node location, reset to Cloning (non-terminal), and
-// requeue so a fresh id is selected.
+// TestHandleVMIDCollision_Recovers covers a controller-allocated, not-yet-adopted id (empty
+// providerID, VMIDAllocatedByControllerAnnotation set at allocation): the collision is a benign
+// allocation race and must self-heal - release the id and stale node location, drop the
+// annotation, reset to Cloning (non-terminal), and requeue so a fresh id is selected.
 func TestHandleVMIDCollision_Recovers(t *testing.T) {
 	machineScope, _, _ := setupReconcilerTest(t)
 	machineScope.ProxmoxMachine.Spec.VirtualMachineID = ptr.To(int64(123))
 	machineScope.ProxmoxMachine.Status.ProxmoxNode = ptr.To("node1")
+	machineScope.SetAnnotation(infrav1.VMIDAllocatedByControllerAnnotation, "true")
 	machineScope.InfraCluster.ProxmoxCluster.AddNodeLocation(infrav1.NodeLocation{
 		Machine: corev1.LocalObjectReference{Name: machineScope.Name()},
 		Node:    "node1",
@@ -194,35 +195,41 @@ func TestHandleVMIDCollision_Recovers(t *testing.T) {
 	require.ErrorIs(t, err, ErrVMIDCollision)
 	require.False(t, machineScope.HasFailed())
 	requireConditionIsFalse(t, machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
-	// The colliding id and stale node location are released for re-selection.
+	// The colliding id, its provenance annotation, and the stale node location are released.
 	require.Equal(t, int64(-1), machineScope.GetVirtualMachineID())
 	require.Nil(t, machineScope.ProxmoxMachine.Status.ProxmoxNode)
+	require.NotContains(t, machineScope.ProxmoxMachine.Annotations, infrav1.VMIDAllocatedByControllerAnnotation)
 	require.False(t, machineScope.InfraCluster.ProxmoxCluster.HasMachine(machineScope.Name(), false))
 }
 
-// TestHandleVMIDCollision_TerminalWhenAdopted covers a machine that had already adopted a VM
-// (providerID set) whose name no longer matches. This is not a benign race, so it stays a
-// terminal failure (anti-adoption guard) and the id must NOT be released.
-func TestHandleVMIDCollision_TerminalWhenAdopted(t *testing.T) {
+// TestHandleVMIDCollision_RequeuesWhenAdopted covers a machine that had already adopted a VM
+// (providerID set) whose name no longer matches. It must not release the id and must not latch a
+// terminal VMProvisionFailed - a terminal failure could let MachineHealthCheck delete the VM by
+// id - so it requeues non-terminally with the id retained.
+func TestHandleVMIDCollision_RequeuesWhenAdopted(t *testing.T) {
 	machineScope, _, _ := setupReconcilerTest(t)
 	machineScope.ProxmoxMachine.Spec.VirtualMachineID = ptr.To(int64(123))
 	machineScope.ProxmoxMachine.Status.ProxmoxNode = ptr.To("node1")
+	machineScope.SetAnnotation(infrav1.VMIDAllocatedByControllerAnnotation, "true")
 	machineScope.ProxmoxMachine.Spec.ProviderID = "proxmox://some-uuid"
 
-	require.Error(t, handleVMIDCollision(machineScope, ErrVMIDCollision))
-	require.True(t, machineScope.HasFailed())
+	err := handleVMIDCollision(machineScope, ErrVMIDCollision)
+	require.ErrorIs(t, err, ErrVMIDCollision)
+	require.False(t, machineScope.HasFailed())
 	require.Equal(t, int64(123), machineScope.GetVirtualMachineID())
 }
 
-// TestHandleVMIDCollision_TerminalWhenPinned covers an id that the controller never selected
-// (no ProxmoxNode recorded, i.e. operator-pinned virtualMachineID). Clobbering it would violate
-// operator intent, so it stays a terminal failure and the id is retained.
-func TestHandleVMIDCollision_TerminalWhenPinned(t *testing.T) {
+// TestHandleVMIDCollision_RequeuesWhenPinned covers an operator-pinned id: no allocation
+// annotation, even though a node is recorded (updateVMLocation can set Status.ProxmoxNode for a
+// located pinned id). Releasing it would violate operator intent and going terminal could let MHC
+// delete a VM the machine does not own, so it requeues non-terminally with the id retained.
+func TestHandleVMIDCollision_RequeuesWhenPinned(t *testing.T) {
 	machineScope, _, _ := setupReconcilerTest(t)
 	machineScope.ProxmoxMachine.Spec.VirtualMachineID = ptr.To(int64(123))
-	machineScope.ProxmoxMachine.Status.ProxmoxNode = nil
+	machineScope.ProxmoxMachine.Status.ProxmoxNode = ptr.To("node1")
 
-	require.Error(t, handleVMIDCollision(machineScope, ErrVMIDCollision))
-	require.True(t, machineScope.HasFailed())
+	err := handleVMIDCollision(machineScope, ErrVMIDCollision)
+	require.ErrorIs(t, err, ErrVMIDCollision)
+	require.False(t, machineScope.HasFailed())
 	require.Equal(t, int64(123), machineScope.GetVirtualMachineID())
 }

@@ -385,17 +385,22 @@ handed the **same** VMID before either clone has registered with Proxmox.
 capmox self-heals from such a collision: the machine that loses the race — i.e. the VMID it
 picked turns out to belong to a different machine's VM — releases the colliding VMID and
 re-selects a fresh one on the next reconcile, rather than getting stuck. You may still see a
-transient `Cloning` blip and a re-selected `virtualMachineID` in that machine's status. This
-recovery only applies to VMIDs that capmox itself allocated: if you **pin** a `virtualMachineID`
-manually and it resolves to another VM, that is treated as a misconfiguration and surfaced as a
-terminal `VMProvisionFailed` failure for you to correct, not silently re-rolled.
+transient `Cloning` blip and a re-selected `spec.virtualMachineID` on that machine. This recovery
+only applies to VMIDs that capmox itself allocated. If you **pin** a `virtualMachineID` manually
+(or a machine has already adopted its VM) and the id resolves to another VM, capmox never
+releases or re-rolls it and never deletes it — clearing an operator-pinned id or auto-remediating
+would risk destroying a VM the machine does not own. Instead it surfaces the conflict as a
+non-terminal condition and keeps requeueing, so you can correct the pin.
 
 To avoid collisions entirely, assign each `ProxmoxMachineTemplate` a **non-overlapping**
 `vmIDRange`. VMID selection within a range considers every `ProxmoxMachine` that targets the
 **same Proxmox endpoint** (across all CAPI clusters and namespaces sharing that endpoint's
 credentials), so disjoint ranges guarantee no two clusters on the same Proxmox ever contend for
-the same ID. Machines targeting a *different* Proxmox endpoint are ignored, since their VMIDs
-live in a separate namespace and cannot collide:
+the same ID. Endpoint identity is approximated by the `credentialsRef` secret: clusters that
+share one Proxmox but reference *different* secrets are treated as different endpoints, so give
+them the same `credentialsRef` for cross-cluster exclusion to apply — otherwise the self-heal
+above remains the backstop. Machines whose endpoint cannot be resolved are counted conservatively
+against every range:
 
 ```diff
 kind: ProxmoxMachineTemplate
