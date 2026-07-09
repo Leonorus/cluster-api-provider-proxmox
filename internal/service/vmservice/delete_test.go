@@ -39,6 +39,7 @@ import (
 func TestDeleteVM_SuccessNotFound(t *testing.T) {
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("does not exist")).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: some reason")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(true, nil).Once()
 
@@ -49,6 +50,7 @@ func TestDeleteVM_SuccessNotFound(t *testing.T) {
 func TestDeleteVM_NotFoundButVMIDStillAllocatedKeepsFinalizer(t *testing.T) {
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("does not exist")).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: stale node location")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
 	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(newVMResource(), nil).Once()
@@ -72,9 +74,26 @@ func TestDeleteVM_NotFoundAndVMIDReusedByForeignVMCompletesDeletion(t *testing.T
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 	foreign := &proxmox.ClusterResource{Name: "other-cluster-worker", Node: "node2"}
 
+	// The foreign VM is on another node, so the pre-destroy guard cannot observe it here; the
+	// cluster-wide lookup below is what recognizes the id was reused.
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("does not exist")).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: some reason")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
 	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(foreign, nil).Once()
+
+	require.NoError(t, DeleteVM(context.TODO(), machineScope))
+	requireDeleteComplete(t, machineScope)
+}
+
+// TestDeleteVM_ForeignVMAtNodeIsNotDestroyed covers the pre-destroy ownership guard: the id
+// resolves at this node to a VM that is not ours (a foreign VM that reused the id). Deletion must
+// complete without ever issuing a destroy against that VM.
+func TestDeleteVM_ForeignVMAtNodeIsNotDestroyed(t *testing.T) {
+	machineScope, proxmoxClient := setupDeleteVMTest(t)
+	foreign := newRunningVM()
+	foreign.Name = "other-cluster-worker"
+
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(foreign, nil).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
 	requireDeleteComplete(t, machineScope)
@@ -86,6 +105,7 @@ func TestDeleteVM_NotFoundAndVMIDReusedByForeignVMCompletesDeletion(t *testing.T
 func TestDeleteVM_NotFoundAndVMIDLookupErrorKeepsFinalizer(t *testing.T) {
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("does not exist")).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: stale node location")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
 	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(nil, errors.New("temporary resource lookup failure")).Once()
@@ -110,6 +130,7 @@ func TestDeleteVM_NotFoundAndVMIDPlaceholderNameKeepsFinalizer(t *testing.T) {
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 	placeholder := &proxmox.ClusterResource{Name: placeholderVMName(123), Node: "node1", VMID: 123}
 
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("does not exist")).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: stale node location")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
 	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(placeholder, nil).Once()
@@ -126,6 +147,8 @@ func TestDeleteVM_NotFoundButVMMigratedRelocatesAndKeepsFinalizer(t *testing.T) 
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 	migrated := &proxmox.ClusterResource{Name: machineScope.Name(), Node: "node2", VMID: 123}
 
+	// The VM has moved to node2, so the guard's lookup at the stale node1 finds nothing.
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("does not exist")).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: stale node location")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
 	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(migrated, nil).Once()
@@ -163,6 +186,7 @@ func TestDeleteVM_DestroyTaskFailedButVMIDReusedByForeignVMCompletesDeletion(t *
 func TestDeleteVM_NotFoundAndCheckIDErrorPreservesDeleteContextAndUsesDeletingReason(t *testing.T) {
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("does not exist")).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: stale node location")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, errors.New("temporary checkid failure")).Once()
 
@@ -183,6 +207,7 @@ func TestDeleteVM_NotFoundAndCheckIDErrorPreservesDeleteContextAndUsesDeletingRe
 func TestDeleteVM_SuccessVMIDFree(t *testing.T) {
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("does not exist")).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, goproxmox.ErrVMIDFree).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
@@ -209,6 +234,7 @@ func TestDeleteVM_StoresStopTaskRefAndKeepsFinalizer(t *testing.T) {
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 	task := &proxmox.Task{UPID: "UPID:node1:001", Type: "qmstop"}
 
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(newRunningVM(), nil).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(task, nil).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
@@ -225,6 +251,7 @@ func TestDeleteVM_StoresDestroyTaskRefAndKeepsFinalizer(t *testing.T) {
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
 	task := &proxmox.Task{UPID: "UPID:node1:002", Type: "qmdestroy"}
 
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(newRunningVM(), nil).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(task, nil).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
@@ -341,6 +368,7 @@ func TestDeleteVM_DestroyTaskFailedRetryAfterExpiredStartsNewDelete(t *testing.T
 	proxmoxClient.EXPECT().GetTask(context.TODO(), "UPID:node1:destroy").Return(failedTask, nil).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
 	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(newVMResource(), nil).Once()
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(newRunningVM(), nil).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(newTask, nil).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
@@ -379,6 +407,7 @@ func TestDeleteVM_UnclassifiableTaskLookupErrorClearsStaleTaskAndReissuesDelete(
 	proxmoxClient.EXPECT().GetTask(context.TODO(), "UPID:hv99:destroy").Return(nil, errors.New("hostname lookup 'hv99' failed")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
 	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(newVMResource(), nil).Once()
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(newRunningVM(), nil).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(newTask, nil).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
@@ -426,6 +455,7 @@ func TestDeleteVM_MissingDeletionTaskAndVMIDStillAllocatedStartsNewDelete(t *tes
 	proxmoxClient.EXPECT().GetTask(context.TODO(), "UPID:node1:destroy").Return(nil, errors.New("task expired")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
 	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(newVMResource(), nil).Once()
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(newRunningVM(), nil).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(destroyTask, nil).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
@@ -445,6 +475,7 @@ func TestDeleteVM_NonDeletionTaskRefDoesNotBlockDeletion(t *testing.T) {
 	destroyTask := &proxmox.Task{UPID: "UPID:node1:destroy", Type: "qmdestroy"}
 
 	proxmoxClient.EXPECT().GetTask(context.TODO(), "UPID:node1:start").Return(startTask, nil).Once()
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(newRunningVM(), nil).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(destroyTask, nil).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
@@ -465,6 +496,7 @@ func TestDeleteVM_StopTaskSucceededStartsDestroyTask(t *testing.T) {
 	destroyTask := &proxmox.Task{UPID: "UPID:node1:destroy", Type: "qmdestroy"}
 
 	proxmoxClient.EXPECT().GetTask(context.TODO(), "UPID:node1:stop").Return(stopTask, nil).Once()
+	proxmoxClient.EXPECT().GetVM(context.TODO(), "node1", int64(123)).Return(newRunningVM(), nil).Once()
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(destroyTask, nil).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))

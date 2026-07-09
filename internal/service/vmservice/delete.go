@@ -57,6 +57,18 @@ func DeleteVM(ctx context.Context, machineScope *scope.MachineScope) error {
 	}
 	node := machineScope.LocateProxmoxNode()
 
+	// Ownership guard: never qmdestroy a VM this machine does not own. If the id resolves at this
+	// node to a VM whose identity (UUID once adopted, else name) is not ours - a foreign VM that
+	// reused the id, e.g. a pre-upgrade machine that kept a colliding id - our VM is already gone;
+	// complete deletion without a destroy that would remove the foreign VM. If the VM cannot be
+	// observed here (moved nodes / already gone), fall through: DeleteVM's not-found path and
+	// completeIfVMIDFree resolve it cluster-wide.
+	if vm, gerr := machineScope.InfraCluster.ProxmoxClient.GetVM(ctx, node, vmID); gerr == nil {
+		if matches, initializing := vmIdentityMatches(vm, vm.Name, machineScope); !matches && !initializing {
+			return completeVMDeletion(machineScope)
+		}
+	}
+
 	task, err := machineScope.InfraCluster.ProxmoxClient.DeleteVM(ctx, node, vmID)
 	if err != nil {
 		if errors.Is(err, goproxmox.ErrVMIDFree) {
