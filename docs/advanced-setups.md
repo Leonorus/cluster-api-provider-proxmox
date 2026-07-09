@@ -399,8 +399,10 @@ credentials), so disjoint ranges guarantee no two clusters on the same Proxmox e
 the same ID. Endpoint identity is approximated by the `credentialsRef` secret: clusters that
 share one Proxmox but reference *different* secrets are treated as different endpoints, so give
 them the same `credentialsRef` for cross-cluster exclusion to apply — otherwise the self-heal
-above remains the backstop. Machines whose endpoint cannot be resolved are counted conservatively
-against every range:
+above remains the backstop. Machines whose cluster-to-endpoint mapping cannot be resolved (for
+example a deleted cluster or one missing its cluster-name label) are **not** counted against a
+range, so they never exhaust it; a genuine collision they would have prevented is caught by the
+self-heal above:
 
 ```diff
 kind: ProxmoxMachineTemplate

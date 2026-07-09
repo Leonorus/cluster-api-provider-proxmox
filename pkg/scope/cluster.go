@@ -243,8 +243,13 @@ func (s *ClusterScope) ListProxmoxMachinesForCluster(ctx context.Context) ([]inf
 // this cluster, across all namespaces and CAPI clusters. VMIDs are unique per Proxmox endpoint,
 // which can be shared by several CAPI clusters, so VMID allocation must consider machines
 // beyond the current cluster - but only those on the same endpoint, since ids on a different
-// Proxmox server cannot collide here. Machines whose endpoint cannot be resolved are included
-// conservatively: over-excluding a VMID is harmless, handing out a colliding one is not.
+// Proxmox server cannot collide here.
+//
+// Only machines that can be positively placed on this endpoint are included. A machine whose
+// cluster-to-endpoint mapping cannot be resolved (deleted/renamed cluster, missing cluster-name
+// label) is left out rather than counted against every endpoint: including it conservatively
+// could exhaust a small vmIDRange with ids that may not even live on this server, and a genuine
+// collision that inclusion would have prevented is self-healed by VMID-collision recovery.
 func (s *ClusterScope) ListProxmoxMachines(ctx context.Context) ([]infrav1.ProxmoxMachine, error) {
 	machines, err := s.listProxmoxMachines(ctx)
 	if err != nil {
@@ -261,7 +266,7 @@ func (s *ClusterScope) ListProxmoxMachines(ctx context.Context) ([]infrav1.Proxm
 	for i := range machines {
 		m := machines[i]
 		key := client.ObjectKey{Namespace: m.Namespace, Name: m.Labels[clusterv1.ClusterNameLabel]}
-		if endpoint, known := endpointByCluster[key]; !known || endpoint == myEndpoint {
+		if endpoint, known := endpointByCluster[key]; known && endpoint == myEndpoint {
 			scoped = append(scoped, m)
 		}
 	}
