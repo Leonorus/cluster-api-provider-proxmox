@@ -551,6 +551,8 @@ func TestEnsureVirtualMachine_FindVM(t *testing.T) {
 
 	require.Equal(t, vm, machineScope.VirtualMachine)
 	require.Equal(t, "proxmox://56603c36-46b9-4608-90ae-c731c15eae64", machineScope.GetProviderID())
+	// A machine created before the provenance annotation existed is backfilled on adoption.
+	require.Equal(t, "true", machineScope.ProxmoxMachine.Annotations[infrav1.VMIDAllocatedByControllerAnnotation])
 }
 
 func TestEnsureVirtualMachine_UpdateVMLocation_Error(t *testing.T) {

@@ -256,6 +256,15 @@ func ensureVirtualMachine(ctx context.Context, machineScope *scope.MachineScope)
 	biosUUID := extractUUID(vmRef.VirtualMachineConfig.SMBios1)
 	machineScope.SetProviderID(biosUUID)
 
+	// Backfill the controller-allocation provenance annotation on machines created before it
+	// existed, so an upgraded fleet gains the signal once each machine is reconciled. This is safe
+	// even for operator-pinned ids: VMID-collision self-heal additionally requires providerID=="",
+	// which never holds for an adopted VM, so a backfilled annotation can never cause an adopted
+	// machine's id to be released.
+	if machineScope.ProxmoxMachine.Annotations[infrav1.VMIDAllocatedByControllerAnnotation] == "" {
+		machineScope.SetAnnotation(infrav1.VMIDAllocatedByControllerAnnotation, "true")
+	}
+
 	// setting the VirtualMachine object for completing the reconciliation.
 	machineScope.SetVirtualMachine(vmRef)
 

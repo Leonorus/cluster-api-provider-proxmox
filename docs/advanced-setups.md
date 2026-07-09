@@ -392,6 +392,12 @@ releases or re-rolls it and never deletes it — clearing an operator-pinned id 
 would risk destroying a VM the machine does not own. Instead it surfaces the conflict as a
 non-terminal condition and keeps requeueing, so you can correct the pin.
 
+capmox tells an allocated id from a pinned one via an annotation stamped when it allocates the id.
+Machines created by an older capmox lack it and are backfilled the first time they are reconciled
+after upgrade, so self-heal engages for the whole fleet within a reconcile. The only gap is a
+machine that is mid-provision (not yet adopted) at the exact moment of the upgrade: it behaves as
+before the fix until it finishes provisioning — non-self-healing, but never destructive.
+
 To avoid collisions entirely, assign each `ProxmoxMachineTemplate` a **non-overlapping**
 `vmIDRange`. VMID selection within a range considers every `ProxmoxMachine` that targets the
 **same Proxmox endpoint** (across all CAPI clusters and namespaces sharing that endpoint's
