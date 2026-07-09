@@ -79,6 +79,22 @@ func isTaskNotFoundError(err error) bool {
 		strings.Contains(message, "task expired")
 }
 
+// RetryAfterExpired reports whether the post-failure retry backoff has elapsed, arming it on the
+// first call. It returns false while the caller should keep waiting - the backoff was just armed,
+// or the window has not yet passed - and true once the window has elapsed, at which point the
+// caller should clear the task ref and retry. It is the shared backoff gate for the provisioning
+// (checkAndRetryTask) and deletion (waitForRetryAfter) task state machines.
+func RetryAfterExpired(status *infrav1.ProxmoxMachineStatus, d time.Duration) bool {
+	if status.RetryAfter == nil || status.RetryAfter.IsZero() {
+		status.RetryAfter = &metav1.Time{Time: time.Now().Add(d)}
+		return false
+	}
+	if time.Now().Before(status.RetryAfter.Time) {
+		return false
+	}
+	return true
+}
+
 // ReconcileInFlightTask determines if a task associated to the Proxmox VM object is in flight or not.
 func ReconcileInFlightTask(ctx context.Context, machineScope *scope.MachineScope) (bool, error) {
 	// skip if taskRef is nil.
@@ -153,10 +169,10 @@ func checkAndRetryTask(scope *scope.MachineScope, task *proxmox.Task) (bool, err
 		})
 
 		// Instead of directly requeuing the failed task, wait for the RetryAfter duration to pass
-		// before resetting the taskRef from the ProxmoxMachine status.
-		if scope.ProxmoxMachine.Status.RetryAfter.IsZero() {
-			scope.ProxmoxMachine.Status.RetryAfter = &metav1.Time{Time: time.Now().Add(1 * time.Minute)}
-		} else {
+		// before resetting the taskRef from the ProxmoxMachine status. The within-window wait is
+		// enforced by the RetryAfter guard at the top of this function, so here the shared gate
+		// only ever arms the backoff or reports it expired.
+		if RetryAfterExpired(&scope.ProxmoxMachine.Status, 1*time.Minute) {
 			scope.ProxmoxMachine.Status.TaskRef = nil
 			scope.ProxmoxMachine.Status.RetryAfter = nil
 		}

@@ -367,23 +367,22 @@ func TestDeleteVM_DestroyTaskFailedButVMIDFreeRemovesFinalizer(t *testing.T) {
 	requireDeleteComplete(t, machineScope)
 }
 
-func TestDeleteVM_TransientTaskLookupErrorKeepsTaskRefAndDoesNotDelete(t *testing.T) {
+// TestDeleteVM_UnclassifiableTaskLookupErrorClearsStaleTaskAndReissuesDelete covers a task-lookup
+// failure whose text matches none of the "not found" heuristics (e.g. a task ref naming a removed
+// node) while the VM is still ours: deletion must not livelock holding the stale ref. It drops the
+// stale task and re-issues the destroy, converging regardless of the error classification.
+func TestDeleteVM_UnclassifiableTaskLookupErrorClearsStaleTaskAndReissuesDelete(t *testing.T) {
 	machineScope, proxmoxClient := setupDeleteVMTest(t)
-	machineScope.ProxmoxMachine.Status.TaskRef = ptr.To("UPID:node1:destroy")
+	machineScope.ProxmoxMachine.Status.TaskRef = ptr.To("UPID:hv99:destroy")
+	newTask := &proxmox.Task{UPID: "UPID:node1:new-destroy", Type: "qmdestroy"}
 
-	proxmoxClient.EXPECT().GetTask(context.TODO(), "UPID:node1:destroy").Return(nil, errors.New("501 Not Implemented")).Once()
+	proxmoxClient.EXPECT().GetTask(context.TODO(), "UPID:hv99:destroy").Return(nil, errors.New("hostname lookup 'hv99' failed")).Once()
 	proxmoxClient.EXPECT().CheckID(context.TODO(), int64(123)).Return(false, nil).Once()
 	proxmoxClient.EXPECT().FindVMResource(context.TODO(), uint64(123)).Return(newVMResource(), nil).Once()
+	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(newTask, nil).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
-	requireDeleteInProgress(t, machineScope, "UPID:node1:destroy")
-
-	cond := conditions.Get(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
-	require.NotNil(t, cond)
-	require.Equal(t, metav1.ConditionFalse, cond.Status)
-	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedDeletingReason, cond.Reason)
-	require.Contains(t, cond.Message, "waiting to retry deletion task lookup")
-	require.Contains(t, cond.Message, "501 Not Implemented")
+	requireDeleteInProgress(t, machineScope, "UPID:node1:new-destroy")
 }
 
 func TestDeleteVM_TaskLookupAndCheckIDErrorsPreserveBothErrorsAndUseDeletingReason(t *testing.T) {

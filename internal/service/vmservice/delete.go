@@ -95,12 +95,16 @@ func reconcileInFlightDeletionTask(ctx context.Context, machineScope *scope.Mach
 		if completed, completionErr := completeIfVMIDFree(ctx, machineScope, verificationContext); completionErr != nil || completed {
 			return completed, completionErr
 		}
-		if errors.Is(err, taskservice.ErrTaskNotFound) {
-			clearTaskState(machineScope)
-			return false, nil
-		}
-		setDeletingCondition(machineScope, fmt.Sprintf("waiting to retry deletion task lookup %s: %v", taskRef, err))
-		return true, nil
+		// The task lookup failed and our VM still exists. Do not depend on the error text to
+		// decide whether the task is gone: a task ref naming a removed node ("hostname lookup
+		// 'hvXX' failed") or any otherwise-unrecognized failure would loop forever holding a stale
+		// ref, while a transient message containing "not found" would falsely look resolved.
+		// Completion is already gated on VM ownership above, so here just drop the stale task and
+		// let the next reconcile re-derive progress by re-issuing the destroy - idempotent, since
+		// a still-running destroy is rejected and retried. This makes deletion robust regardless of
+		// how GetTask classified the error.
+		clearTaskState(machineScope)
+		return false, nil
 	}
 	if task == nil {
 		return true, nil
@@ -153,19 +157,12 @@ func clearTaskState(machineScope *scope.MachineScope) {
 }
 
 func waitForRetryAfter(machineScope *scope.MachineScope, task *proxmox.Task) bool {
-	retryAfter := machineScope.ProxmoxMachine.Status.RetryAfter
-	if retryAfter == nil || retryAfter.IsZero() {
-		setDeletionFailedCondition(machineScope, deletionTaskFailureMessage(task))
-		machineScope.ProxmoxMachine.Status.RetryAfter = &metav1.Time{Time: time.Now().Add(deletionTaskRetryAfter)}
-		return true
+	if taskservice.RetryAfterExpired(&machineScope.ProxmoxMachine.Status, deletionTaskRetryAfter) {
+		clearTaskState(machineScope)
+		return false
 	}
-	if time.Now().Before(retryAfter.Time) {
-		setDeletionFailedCondition(machineScope, deletionTaskFailureMessage(task))
-		return true
-	}
-
-	clearTaskState(machineScope)
-	return false
+	setDeletionFailedCondition(machineScope, deletionTaskFailureMessage(task))
+	return true
 }
 
 func setDeletingCondition(machineScope *scope.MachineScope, message string) {
