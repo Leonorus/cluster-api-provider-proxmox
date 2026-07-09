@@ -106,6 +106,25 @@ func TestFindVM_VMIDCollision(t *testing.T) {
 	require.ErrorIs(t, err, ErrVMIDCollision)
 }
 
+// TestFindVM_NotInitializedPlaceholderName covers the real-hardware behavior that the empty-name
+// sentinel missed: Proxmox reports a freshly-cloned, not-yet-renamed VM with the placeholder
+// name "VM <vmid>", not "". That is the machine's own in-flight clone, so it must be reported as
+// not-initialized (wait) rather than a collision - otherwise the id is released and re-rolled,
+// orphaning the clone.
+func TestFindVM_NotInitializedPlaceholderName(t *testing.T) {
+	ctx := context.TODO()
+	machineScope, proxmoxClient, _ := setupReconcilerTest(t)
+	vm := newRunningVM()
+	vm.Name = placeholderVMName(int64(vm.VMID))
+	machineScope.ProxmoxMachine.Spec.VirtualMachineID = ptr.To(int64(vm.VMID))
+	machineScope.ProxmoxMachine.Status.ProxmoxNode = ptr.To("node2")
+
+	proxmoxClient.EXPECT().GetVM(ctx, "node2", int64(123)).Return(vm, nil).Once()
+
+	_, err := FindVM(ctx, machineScope)
+	require.ErrorIs(t, err, ErrVMNotInitialized)
+}
+
 func TestUpdateVMLocation_MissingName(t *testing.T) {
 	ctx := context.TODO()
 	machineScope, proxmoxClient, _ := setupReconcilerTest(t)
@@ -143,6 +162,28 @@ func TestUpdateVMLocation_Collision(t *testing.T) {
 	// Detector only: no state mutation, no terminal failure.
 	require.False(t, machineScope.HasFailed())
 	require.Equal(t, int64(123), machineScope.GetVirtualMachineID())
+}
+
+// TestUpdateVMLocation_PlaceholderName covers the same placeholder-name case on the cluster-wide
+// relocation path: a VM still carrying Proxmox's "VM <vmid>" placeholder is this machine's clone
+// initializing, so updateVMLocation must requeue (plain error) rather than report a collision.
+func TestUpdateVMLocation_PlaceholderName(t *testing.T) {
+	ctx := context.TODO()
+	machineScope, proxmoxClient, _ := setupReconcilerTest(t)
+	vm := newRunningVM()
+	vmr := newVMResource()
+	vmr.Name = placeholderVMName(int64(vm.VMID))
+	vm.VirtualMachineConfig.Name = placeholderVMName(int64(vm.VMID))
+	machineScope.ProxmoxMachine.Spec.VirtualMachineID = ptr.To(int64(vm.VMID))
+	machineScope.ProxmoxMachine.Status.ProxmoxNode = ptr.To("node1")
+
+	proxmoxClient.EXPECT().FindVMResource(ctx, uint64(123)).Return(vmr, nil).Once()
+	proxmoxClient.EXPECT().GetVM(ctx, "node1", int64(123)).Return(vm, nil).Once()
+
+	err := updateVMLocation(ctx, machineScope)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrVMIDCollision)
+	require.False(t, machineScope.HasFailed())
 }
 
 func TestUpdateVMLocation_UpdateNode(t *testing.T) {

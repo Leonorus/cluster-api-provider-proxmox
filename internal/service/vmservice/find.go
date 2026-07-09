@@ -46,6 +46,14 @@ var (
 	ErrVMIDCollision = errors.New("vmid collision: id belongs to a different vm")
 )
 
+// placeholderVMName returns the name Proxmox reports for a VM that has no configured name yet,
+// e.g. "VM 136". A freshly-cloned VM carries this placeholder until the name requested at clone
+// time propagates; matching it lets the caller wait for initialization instead of mistaking the
+// machine's own clone for a foreign VM.
+func placeholderVMName(vmID int64) string {
+	return fmt.Sprintf("VM %d", vmID)
+}
+
 // FindVM returns the Proxmox VM if the vmID is set, otherwise
 // returns ErrVMNotCreated or ErrVMNotFound if the VM doesn't exist.
 func FindVM(ctx context.Context, scope *scope.MachineScope) (*proxmox.VirtualMachine, error) {
@@ -59,12 +67,16 @@ func FindVM(ctx context.Context, scope *scope.MachineScope) (*proxmox.VirtualMac
 			scope.Error(err, "unable to find vm")
 			return nil, ErrVMNotFound
 		}
-		// A freshly-cloned VM may not have its name populated yet; wait for it.
-		if vm.Name == "" {
+		// A freshly-cloned VM may not have its final name yet; wait for it. Proxmox reports an
+		// as-yet-unnamed VM with the placeholder "VM <vmid>" (not an empty string) until the
+		// clone finishes applying the requested name, so treat that placeholder the same as an
+		// empty name. Declaring a collision here would be a false positive against this machine's
+		// own in-flight clone and would orphan it when the id is released and re-rolled.
+		if vm.Name == "" || vm.Name == placeholderVMName(vmID) {
 			scope.Info("vm is not initialized yet")
 			return nil, ErrVMNotInitialized
 		}
-		// A non-empty name that is not ours means the id resolves to a different machine's VM:
+		// A real name that is not ours means the id resolves to a different machine's VM:
 		// a VMID collision (handled by the caller via handleVMIDCollision).
 		if vm.Name != scope.ProxmoxMachine.GetName() {
 			return nil, fmt.Errorf("vmid %d resolves to VM %q, expected %q: %w",
@@ -109,7 +121,7 @@ func updateVMLocation(ctx context.Context, s *scope.MachineScope) error {
 	// It might happen that even when a task is already finished,
 	// we still have to wait until we can get the correct
 	// information for a particular resource.
-	if vm.VirtualMachineConfig.Name == "" {
+	if vm.VirtualMachineConfig.Name == "" || vm.VirtualMachineConfig.Name == placeholderVMName(vmID) {
 		return errors.New("vm exists but does not have a name yet")
 	}
 
